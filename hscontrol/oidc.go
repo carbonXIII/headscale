@@ -122,6 +122,23 @@ func (h *Headscale) RegisterOIDC(
 		return
 	}
 
+	rawIDToken, err := extractAuthForOIDC(req)
+	if err != nil {
+		util.LogErr(err, "Failed to extract auth token if present")
+		http.Error(writer, "Malformed Authentication header", http.StatusBadRequest)
+		return
+	}
+
+	if len(rawIDToken) > 0 {
+		claims, expiry, err := h.verifyIDTokenForOIDCCallback(req.Context(), writer, rawIDToken)
+		if err != nil {
+			return
+		}
+
+		h.ensureNodeForOIDCCallback(writer, machineKey, *claims, expiry)
+		return
+	}
+
 	randomBlob := make([]byte, randomByteSize)
 	if _, err := rand.Read(randomBlob); err != nil {
 		util.LogErr(err, "could not read 16 bytes from rand")
@@ -184,72 +201,19 @@ func (h *Headscale) OIDCCallback(
 		return
 	}
 
-	idToken, err := h.verifyIDTokenForOIDCCallback(req.Context(), writer, rawIDToken)
-	if err != nil {
-		return
-	}
-	idTokenExpiry := h.determineTokenExpiration(idToken.Expiry)
-
-	// TODO: we can use userinfo at some point to grab additional information about the user (groups membership, etc)
-	// userInfo, err := oidcProvider.UserInfo(context.Background(), oauth2.StaticTokenSource(oauth2Token))
-	// if err != nil {
-	// 	c.String(http.StatusBadRequest, fmt.Sprintf("Failed to retrieve userinfo"))
-	// 	return
-	// }
-
-	claims, err := extractIDTokenClaims(writer, idToken)
+	claims, expiry, err := h.verifyIDTokenForOIDCCallback(req.Context(), writer, rawIDToken)
 	if err != nil {
 		return
 	}
 
-	if err := validateOIDCAllowedDomains(writer, h.cfg.OIDC.AllowedDomains, claims); err != nil {
-		return
-	}
-
-	if err := validateOIDCAllowedGroups(writer, h.cfg.OIDC.AllowedGroups, claims); err != nil {
-		return
-	}
-
-	if err := validateOIDCAllowedUsers(writer, h.cfg.OIDC.AllowedUsers, claims); err != nil {
-		return
-	}
-
-	machineKey, nodeExists, err := h.validateNodeForOIDCCallback(
-		writer,
-		state,
-		claims,
-		idTokenExpiry,
-	)
-	if err != nil || nodeExists {
-		return
-	}
-
-	userName, err := getUserName(writer, claims, h.cfg.OIDC.StripEmaildomain)
+	machineKey, err := h.getMachineKeyForOIDCCallback(writer, state)
 	if err != nil {
 		return
 	}
 
-	// register the node if it's new
-	log.Debug().Msg("Registering new node after successful callback")
-
-	user, err := h.findOrCreateNewUserForOIDCCallback(writer, userName)
+	err = h.ensureNodeForOIDCCallback(writer, *machineKey, *claims, expiry)
 	if err != nil {
 		return
-	}
-
-	if err := h.registerNodeForOIDCCallback(writer, user, machineKey, idTokenExpiry); err != nil {
-		return
-	}
-
-	content, err := renderOIDCCallbackTemplate(writer, claims)
-	if err != nil {
-		return
-	}
-
-	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
-	if _, err := writer.Write(content.Bytes()); err != nil {
-		util.LogErr(err, "Failed to write response")
 	}
 }
 
@@ -313,11 +277,27 @@ func (h *Headscale) getIDTokenForOIDCCallback(
 	return rawIDToken, nil
 }
 
+func extractAuthForOIDC(
+	req *http.Request,
+) (rawIDToken string, err error) {
+	authHeader := req.Header.Get("Authorization")
+	if len(authHeader) == 0 {
+		return "", nil
+	}
+
+	splitToken := strings.Split(authHeader, "Bearer ")
+	if len(splitToken) < 2 {
+		return "", fmt.Errorf("Authentication header is not empty, but malformed: %s", authHeader)
+	}
+
+	return splitToken[1], nil
+}
+
 func (h *Headscale) verifyIDTokenForOIDCCallback(
 	ctx context.Context,
 	writer http.ResponseWriter,
 	rawIDToken string,
-) (*oidc.IDToken, error) {
+) (claims *IDTokenClaims, expiry time.Time, err error) {
 	verifier := h.oidcProvider.Verifier(&oidc.Config{ClientID: h.cfg.OIDC.ClientID})
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
@@ -329,10 +309,35 @@ func (h *Headscale) verifyIDTokenForOIDCCallback(
 			util.LogErr(err, "Failed to write response")
 		}
 
-		return nil, err
+		return
 	}
 
-	return idToken, nil
+	expiry = h.determineTokenExpiration(idToken.Expiry)
+
+	if claims, err = extractIDTokenClaims(writer, idToken); err != nil {
+		return
+	}
+
+	// TODO: we can use userinfo at some point to grab additional information about the user (groups membership, etc)
+	// userInfo, err := oidcProvider.UserInfo(context.Background(), oauth2.StaticTokenSource(oauth2Token))
+	// if err != nil {
+	// 	c.String(http.StatusBadRequest, fmt.Sprintf("Failed to retrieve userinfo"))
+	// 	return
+	// }
+
+	if err = validateOIDCAllowedDomains(writer, h.cfg.OIDC.AllowedDomains, claims); err != nil {
+		return
+	}
+
+	if err = validateOIDCAllowedGroups(writer, h.cfg.OIDC.AllowedGroups, claims); err != nil {
+		return
+	}
+
+	if err = validateOIDCAllowedUsers(writer, h.cfg.OIDC.AllowedUsers, claims); err != nil {
+		return
+	}
+
+	return
 }
 
 func extractIDTokenClaims(
@@ -435,17 +440,52 @@ func validateOIDCAllowedUsers(
 	return nil
 }
 
-// validateNode retrieves node information if it exist
-// The error is not important, because if it does not
-// exist, then this is a new node and we will move
-// on to registration.
-func (h *Headscale) validateNodeForOIDCCallback(
+func (h* Headscale) ensureNodeForOIDCCallback(
+	writer http.ResponseWriter,
+	machineKey key.MachinePublic,
+	claims IDTokenClaims,
+	expiry time.Time,
+) (err error) {
+	node, err := h.validateNodeForOIDCCallback(writer, machineKey, &claims, expiry)
+	if err != nil || node != nil {
+		return
+	}
+
+	// register the node if it's new
+	log.Debug().Msg("Registering new node after successful callback")
+
+	userName, err := getUserName(writer, &claims, h.cfg.OIDC.StripEmaildomain)
+	if err != nil {
+		return
+	}
+
+	user, err := h.findOrCreateNewUserForOIDCCallback(writer, userName)
+	if err != nil {
+		return
+	}
+
+	if err = h.registerNodeForOIDCCallback(writer, user, &machineKey, expiry); err != nil {
+		return
+	}
+
+	content, err := renderOIDCCallbackTemplate(writer, &claims)
+	if err != nil {
+		return
+	}
+
+	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	if _, err := writer.Write(content.Bytes()); err != nil {
+		util.LogErr(err, "Failed to write response")
+	}
+
+	return nil
+}
+
+func (h* Headscale) getMachineKeyForOIDCCallback(
 	writer http.ResponseWriter,
 	state string,
-	claims *IDTokenClaims,
-	expiry time.Time,
-) (*key.MachinePublic, bool, error) {
-	// retrieve nodekey from state cache
+) (*key.MachinePublic, error) {
 	machineKeyIf, machineKeyFound := h.registrationCache.Get(state)
 	if !machineKeyFound {
 		log.Trace().
@@ -457,7 +497,7 @@ func (h *Headscale) validateNodeForOIDCCallback(
 			util.LogErr(err, "Failed to write response")
 		}
 
-		return nil, false, errOIDCNodeKeyMissing
+		return nil, errOIDCNodeKeyMissing
 	}
 
 	var machineKey key.MachinePublic
@@ -473,9 +513,22 @@ func (h *Headscale) validateNodeForOIDCCallback(
 			util.LogErr(err, "Failed to write response")
 		}
 
-		return nil, false, errOIDCInvalidNodeState
+		return nil, errOIDCInvalidNodeState
 	}
 
+	return &machineKey, nil
+}
+
+// validateNode retrieves node information if it exist
+// The error is not important, because if it does not
+// exist, then this is a new node and we will move
+// on to registration.
+func (h *Headscale) validateNodeForOIDCCallback(
+	writer http.ResponseWriter,
+	machineKey key.MachinePublic,
+	claims *IDTokenClaims,
+	expiry time.Time,
+) (*types.Node, error) {
 	// retrieve node information if it exist
 	// The error is not important, because if it does not
 	// exist, then this is a new node and we will move
@@ -497,7 +550,7 @@ func (h *Headscale) validateNodeForOIDCCallback(
 				http.StatusInternalServerError,
 			)
 
-			return nil, true, err
+			return nil, err
 		}
 		log.Debug().
 			Str("node", node.Hostname).
@@ -516,7 +569,7 @@ func (h *Headscale) validateNodeForOIDCCallback(
 				util.LogErr(err, "Failed to write response")
 			}
 
-			return nil, true, fmt.Errorf("rendering OIDC callback template: %w", err)
+			return nil, fmt.Errorf("rendering OIDC callback template: %w", err)
 		}
 
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -529,10 +582,10 @@ func (h *Headscale) validateNodeForOIDCCallback(
 		ctx := types.NotifyCtx(context.Background(), "oidc-expiry", "na")
 		h.nodeNotifier.NotifyWithIgnore(ctx, types.StateUpdateExpire(node.ID, expiry), node.ID)
 
-		return nil, true, nil
+		return nil, nil
 	}
 
-	return &machineKey, false, nil
+	return node, nil
 }
 
 func getUserName(
